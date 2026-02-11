@@ -119,6 +119,19 @@ const generateGameId = () => {
 
 const generateSessionId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
+const toBase64Url = (str: string): string => {
+  const base64 = btoa(str)
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+const fromBase64Url = (str: string): string => {
+  let base64 = str.replace(/-/g, '+').replace(/_/g, '/')
+  const padding = (4 - (base64.length % 4)) % 4
+  if (padding) {
+    base64 += '='.repeat(padding)
+  }
+  return atob(base64)
+}
 
 const formatAsDatetimeLocal = (date: Date) => {
   const pad = (value: number) => value.toString().padStart(2, '0')
@@ -207,6 +220,8 @@ function App() {
   const [voteIgnoreMessage, setVoteIgnoreMessage] = useState<string | null>(null)
   const [roleAssignmentNotice, setRoleAssignmentNotice] = useState<string | null>(null)
   const [newGameConfirmOpen, setNewGameConfirmOpen] = useState(false)
+  const [highlightStep3, setHighlightStep3] = useState(false)
+  const [highlightStep4, setHighlightStep4] = useState(false)
 
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const dataChannelRef = useRef<RTCDataChannel | null>(null)
@@ -222,6 +237,20 @@ function App() {
   const assignRolesRetryTimerRef = useRef<number | null>(null)
   const rolesConfirmedRef = useRef(false)
   const sessionRolesRef = useRef<SessionRoles | null>(null)
+  const hasAutoCopiedOfferRef = useRef(false)
+  const hasAutoCopiedAnswerRef = useRef(false)
+  const hasAutoAppliedOfferRef = useRef(false)
+  const hasAutoAppliedAnswerRef = useRef(false)
+  const autoReconnectInProgressRef = useRef(false)
+  const autoReconnectAttemptsRef = useRef(0)
+  const autoReconnectTimerRef = useRef<number | null>(null)
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null)
+  const signalMessageHandlerRef = useRef<(data: any) => void>(() => {})
+  const connectionStatusRef = useRef<ConnectionStatus>('idle')
+  const prevConnectionStatusRef = useRef<ConnectionStatus>('idle')
+  const prevGameStateRef = useRef<GameState>('idle')
+  const step3Ref = useRef<HTMLDivElement | null>(null)
+  const step4Ref = useRef<HTMLDivElement | null>(null)
 
   const resetGameState = useCallback(() => {
     if (timerRef.current !== null) {
@@ -306,6 +335,56 @@ function App() {
       window.clearTimeout(assignRolesRetryTimerRef.current)
       assignRolesRetryTimerRef.current = null
     }
+  }, [])
+
+  const clearAutoReconnectTimer = useCallback(() => {
+    if (autoReconnectTimerRef.current !== null) {
+      window.clearTimeout(autoReconnectTimerRef.current)
+      autoReconnectTimerRef.current = null
+    }
+  }, [])
+
+  const resetAutoReconnectState = useCallback(() => {
+    autoReconnectInProgressRef.current = false
+    autoReconnectAttemptsRef.current = 0
+    clearAutoReconnectTimer()
+  }, [clearAutoReconnectTimer])
+
+  const closeBroadcastChannel = useCallback(() => {
+    if (broadcastChannelRef.current) {
+      try {
+        broadcastChannelRef.current.close()
+      } catch (e) {
+        console.error(e)
+      }
+      broadcastChannelRef.current = null
+    }
+  }, [])
+
+  const ensureSignalChannel = useCallback((): BroadcastChannel | null => {
+    if (typeof window === 'undefined' || !('BroadcastChannel' in window)) {
+      return null
+    }
+    if (broadcastChannelRef.current) {
+      return broadcastChannelRef.current
+    }
+    const channel = new BroadcastChannel('vote2p-signal')
+    channel.onmessage = (event) => {
+      try {
+        signalMessageHandlerRef.current?.(event.data)
+      } catch (e) {
+        console.error(e)
+      }
+    }
+    broadcastChannelRef.current = channel
+    return channel
+  }, [])
+
+  const resetAutoSignalFlags = useCallback(() => {
+    hasAutoCopiedOfferRef.current = false
+    hasAutoCopiedAnswerRef.current = false
+    hasAutoAppliedOfferRef.current = false
+    hasAutoAppliedAnswerRef.current = false
   }, [])
 
   const resetSessionAndRolesForNewAnswerJoin = useCallback(() => {
@@ -399,6 +478,184 @@ function App() {
     },
     [setError],
   )
+
+  const handleRestartOffer = useCallback(
+    async (incomingSdp: any, incomingSessionId?: string | null) => {
+      try {
+        if (connectionModeRef.current !== 'answer') {
+          return
+        }
+        const pc = pcRef.current
+        if (!pc) {
+          return
+        }
+        const desc = typeof incomingSdp === 'string' ? JSON.parse(incomingSdp) : incomingSdp
+        await pc.setRemoteDescription(desc)
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        const channel = ensureSignalChannel()
+        const sessionKey =
+          sessionIdRef.current || currentRoundIdRef.current || storedGameIdHint || incomingSessionId || null
+
+        if (channel && sessionKey) {
+          channel.postMessage({
+            type: 'restart-answer',
+            sessionId: sessionKey,
+            payload: answer,
+          })
+        }
+
+        setStatusMessage('检测到连接中断，已自动应答重连请求。')
+      } catch (e) {
+        console.error('处理 restart-offer 失败', e)
+      }
+    },
+    [ensureSignalChannel, setStatusMessage, storedGameIdHint],
+  )
+
+  const handleRestartAnswer = useCallback(
+    async (incomingSdp: any) => {
+      try {
+        if (connectionModeRef.current !== 'offer') {
+          return
+        }
+        const pc = pcRef.current
+        if (!pc) {
+          return
+        }
+        const desc = typeof incomingSdp === 'string' ? JSON.parse(incomingSdp) : incomingSdp
+        await pc.setRemoteDescription(desc)
+        setStatusMessage('正在等待连接自动恢复…')
+      } catch (e) {
+        console.error('处理 restart-answer 失败', e)
+      }
+    },
+    [setStatusMessage],
+  )
+
+  const handleSignalMessage = useCallback(
+    (data: any) => {
+      if (!data || typeof data !== 'object') {
+        return
+      }
+
+      const { type, sessionId: msgSessionId, payload } = data as {
+        type?: string
+        sessionId?: string | null
+        payload?: any
+      }
+
+      if (type !== 'restart-offer' && type !== 'restart-answer') {
+        return
+      }
+
+      const currentSessionKey = sessionIdRef.current || currentRoundIdRef.current || storedGameIdHint
+
+      if (msgSessionId && currentSessionKey && msgSessionId !== currentSessionKey) {
+        return
+      }
+
+      if (type === 'restart-offer') {
+        void handleRestartOffer(payload, msgSessionId)
+      } else if (type === 'restart-answer') {
+        void handleRestartAnswer(payload)
+      }
+    },
+    [handleRestartAnswer, handleRestartOffer, storedGameIdHint],
+  )
+
+  const performIceRestartAttempt = useCallback(async () => {
+    const pc = pcRef.current
+    if (!pc) {
+      resetAutoReconnectState()
+      return
+    }
+
+    const iceState = pc.iceConnectionState
+    const connState = pc.connectionState
+    if (connState === 'connected' || iceState === 'connected') {
+      resetAutoReconnectState()
+      return
+    }
+
+    const maxAttempts = 3
+    const attemptIndex = autoReconnectAttemptsRef.current
+    if (attemptIndex >= maxAttempts) {
+      resetAutoReconnectState()
+      setConnectionStatus('error')
+      setError('P2P 连接出现问题，请检查网络或重新建立连接。')
+      return
+    }
+
+    setStatusMessage('正在尝试自动恢复连接…')
+
+    try {
+      const offer = await pc.createOffer({ iceRestart: true })
+      await pc.setLocalDescription(offer)
+
+      const channel = ensureSignalChannel()
+      const sessionKey = sessionIdRef.current || currentRoundIdRef.current || storedGameIdHint
+
+      if (channel && sessionKey) {
+        channel.postMessage({
+          type: 'restart-offer',
+          sessionId: sessionKey,
+          payload: offer,
+        })
+      }
+    } catch (e) {
+      console.error('自动 ICE 重启失败', e)
+    } finally {
+      const nextIndex = attemptIndex + 1
+      autoReconnectAttemptsRef.current = nextIndex
+
+      if (nextIndex >= maxAttempts) {
+        return
+      }
+
+      const latestPc = pcRef.current
+      if (!latestPc) {
+        resetAutoReconnectState()
+        return
+      }
+      if (
+        latestPc.connectionState === 'connected' ||
+        latestPc.iceConnectionState === 'connected'
+      ) {
+        resetAutoReconnectState()
+        return
+      }
+
+      const delays = [5000, 10000, 20000]
+      clearAutoReconnectTimer()
+      const delay = delays[nextIndex] ?? delays[delays.length - 1]
+      autoReconnectTimerRef.current = window.setTimeout(() => {
+        void performIceRestartAttempt()
+      }, delay)
+    }
+  }, [clearAutoReconnectTimer, ensureSignalChannel, resetAutoReconnectState, setConnectionStatus, setError, setStatusMessage, storedGameIdHint])
+
+  const startAutoReconnect = useCallback(() => {
+    if (autoReconnectInProgressRef.current) {
+      return
+    }
+    if (connectionModeRef.current !== 'offer') {
+      return
+    }
+    const pc = pcRef.current
+    if (!pc) {
+      return
+    }
+    autoReconnectInProgressRef.current = true
+    autoReconnectAttemptsRef.current = 0
+    clearAutoReconnectTimer()
+    setStatusMessage('正在尝试自动恢复连接…')
+    const delays = [5000, 10000, 20000]
+    autoReconnectTimerRef.current = window.setTimeout(() => {
+      void performIceRestartAttempt()
+    }, delays[0])
+  }, [clearAutoReconnectTimer, performIceRestartAttempt, setStatusMessage])
 
   const buildSnapshotFromState = useCallback((): GameSnapshot | null => {
     if (!currentRoundId || !startTimeSec || !endTimeSec || !lockedRole) {
@@ -710,8 +967,14 @@ function App() {
     (channel: RTCDataChannel) => {
       channel.onopen = () => {
         setConnectionStatus('connected')
-        setStatusMessage('已建立 P2P 连接，可以开始对局。')
+        if (autoReconnectInProgressRef.current || autoReconnectAttemptsRef.current > 0) {
+          resetAutoReconnectState()
+          setStatusMessage('连接已恢复')
+        } else {
+          setStatusMessage('已建立 P2P 连接，可以开始对局。')
+        }
         setError(null)
+        ensureSignalChannel()
       }
 
       channel.onclose = () => {
@@ -732,7 +995,7 @@ function App() {
         }
       }
     },
-    [handleIncomingMessage],
+    [ensureSignalChannel, handleIncomingMessage, resetAutoReconnectState],
   )
 
   const cleanupConnection = useCallback(() => {
@@ -775,13 +1038,20 @@ function App() {
     setRoleSyncMessage(null)
     setRoleAssignmentNotice(null)
     setHistoryViewSnapshot(null)
-  }, [clearAssignRolesRetryTimer, resetGameState])
+    resetAutoSignalFlags()
+    resetAutoReconnectState()
+    closeBroadcastChannel()
+  }, [clearAssignRolesRetryTimer, closeBroadcastChannel, resetAutoReconnectState, resetGameState, resetAutoSignalFlags])
 
   useEffect(() => {
     return () => {
       cleanupConnection()
     }
   }, [cleanupConnection])
+
+  useEffect(() => {
+    signalMessageHandlerRef.current = handleSignalMessage
+  }, [handleSignalMessage])
 
   useEffect(() => {
     connectionModeRef.current = connectionMode
@@ -814,6 +1084,106 @@ function App() {
       window.clearTimeout(timer)
     }
   }, [roleAssignmentNotice])
+
+  useEffect(() => {
+    if (!statusMessage) {
+      return
+    }
+    const timer = window.setTimeout(() => {
+      setStatusMessage('')
+    }, 2500)
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [statusMessage])
+
+  useEffect(() => {
+    connectionStatusRef.current = connectionStatus
+  }, [connectionStatus])
+
+  useEffect(() => {
+    const prev = prevConnectionStatusRef.current
+    prevConnectionStatusRef.current = connectionStatus
+
+    let timeoutId: number | null = null
+
+    if (prev !== 'connected' && connectionStatus === 'connected') {
+      setHighlightStep3(true)
+      const node = step3Ref.current
+      if (node && typeof node.scrollIntoView === 'function') {
+        try {
+          node.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        } catch (e) {
+          console.error(e)
+        }
+      }
+      timeoutId = window.setTimeout(() => {
+        setHighlightStep3(false)
+      }, 3000)
+    }
+
+    return () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+      }
+    }
+  }, [connectionStatus])
+
+  useEffect(() => {
+    const prev = prevGameStateRef.current
+    prevGameStateRef.current = gameState
+
+    let timeoutId: number | null = null
+
+    if (prev !== 'running' && gameState === 'running') {
+      setHighlightStep4(true)
+      const node = step4Ref.current
+      if (node && typeof node.scrollIntoView === 'function') {
+        try {
+          node.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        } catch (e) {
+          console.error(e)
+        }
+      }
+      timeoutId = window.setTimeout(() => {
+        setHighlightStep4(false)
+      }, 3000)
+    }
+
+    return () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+      }
+    }
+  }, [gameState])
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') {
+        return
+      }
+      if (connectionStatusRef.current === 'connected') {
+        return
+      }
+      if (connectionModeRef.current !== 'offer') {
+        return
+      }
+      if (!pcRef.current) {
+        return
+      }
+      autoReconnectInProgressRef.current = true
+      if (autoReconnectAttemptsRef.current >= 3) {
+        autoReconnectAttemptsRef.current = 0
+      }
+      clearAutoReconnectTimer()
+      void performIceRestartAttempt()
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [clearAutoReconnectTimer, performIceRestartAttempt])
 
   useEffect(() => {
     try {
@@ -870,6 +1240,24 @@ function App() {
       console.error(e)
     }
   }, [hydrateStateFromSnapshot])
+
+  useEffect(() => {
+    try {
+      const url = new URL(window.location.href)
+      const sdpParam = url.searchParams.get('sdp')
+      if (!sdpParam) {
+        return
+      }
+      const decoded = fromBase64Url(sdpParam)
+      if (!decoded) {
+        return
+      }
+      setConnectionMode('answer')
+      setRemoteSdp(decoded)
+    } catch (e) {
+      console.error(e)
+    }
+  }, [])
 
   useEffect(() => {
     if (!endTimeSec || gameState !== 'running') {
@@ -1048,6 +1436,138 @@ function App() {
     startTimeSec,
   ])
 
+  useEffect(() => {
+    if (connectionMode !== 'offer') {
+      return
+    }
+    if (!localSdp) {
+      return
+    }
+    if (hasAutoCopiedOfferRef.current) {
+      return
+    }
+
+    hasAutoCopiedOfferRef.current = true
+
+    let cancelled = false
+
+    const copyOfferToClipboard = async () => {
+      try {
+        await navigator.clipboard.writeText(localSdp)
+        if (cancelled) return
+        setStatusMessage('已自动复制 Offer 到剪贴板')
+      } catch (e) {
+        console.error(e)
+        if (cancelled) return
+        setStatusMessage('自动复制 Offer 失败，请手动复制下方文本。')
+      }
+    }
+
+    copyOfferToClipboard()
+
+    return () => {
+      cancelled = true
+    }
+  }, [connectionMode, localSdp])
+
+  useEffect(() => {
+    if (connectionMode !== 'answer') {
+      return
+    }
+    if (!remoteSdp.trim()) {
+      return
+    }
+    if (hasAutoAppliedOfferRef.current) {
+      return
+    }
+
+    hasAutoAppliedOfferRef.current = true
+
+    let cancelled = false
+
+    const applyOfferAutomatically = async () => {
+      const ok = await handleApplyOfferAndCreateAnswer()
+      if (cancelled) return
+      if (ok) {
+        setStatusMessage('已自动应用 Offer 并生成 Answer')
+      } else {
+        setStatusMessage('自动应用 Offer 失败，请检查粘贴内容')
+      }
+    }
+
+    applyOfferAutomatically()
+
+    return () => {
+      cancelled = true
+    }
+  }, [connectionMode, remoteSdp])
+
+  useEffect(() => {
+    if (connectionMode !== 'answer') {
+      return
+    }
+    if (!localSdp) {
+      return
+    }
+    if (hasAutoCopiedAnswerRef.current) {
+      return
+    }
+
+    hasAutoCopiedAnswerRef.current = true
+
+    let cancelled = false
+
+    const copyAnswerToClipboard = async () => {
+      try {
+        await navigator.clipboard.writeText(localSdp)
+        if (cancelled) return
+        setStatusMessage('已自动复制 Answer 到剪贴板')
+      } catch (e) {
+        console.error(e)
+        if (cancelled) return
+        setStatusMessage('自动复制 Answer 失败，请手动复制下方文本。')
+      }
+    }
+
+    copyAnswerToClipboard()
+
+    return () => {
+      cancelled = true
+    }
+  }, [connectionMode, localSdp])
+
+  useEffect(() => {
+    if (connectionMode !== 'offer') {
+      return
+    }
+    if (!remoteSdp.trim()) {
+      return
+    }
+    if (hasAutoAppliedAnswerRef.current) {
+      return
+    }
+
+    hasAutoAppliedAnswerRef.current = true
+
+    let cancelled = false
+
+    const applyAnswerAutomatically = async () => {
+      const ok = await handleApplyRemoteAnswer()
+      if (cancelled) return
+      if (ok) {
+        setStatusMessage('已自动应用 Answer 并尝试连接')
+      } else {
+        setStatusMessage('自动应用 Answer 失败，请检查粘贴内容')
+      }
+    }
+
+    applyAnswerAutomatically()
+
+    return () => {
+      cancelled = true
+    }
+  }, [connectionMode, remoteSdp])
+
   const createPeerConnection = useCallback(
     (mode: ConnectionMode) => {
       if (pcRef.current) {
@@ -1068,8 +1588,9 @@ function App() {
       pc.oniceconnectionstatechange = () => {
         const state = pc.iceConnectionState
         if (state === 'failed' || state === 'disconnected') {
-          setConnectionStatus('error')
-          setError('P2P 连接出现问题，请检查网络或重新建立连接。')
+          if (connectionModeRef.current === 'offer') {
+            startAutoReconnect()
+          }
         }
       }
 
@@ -1077,12 +1598,22 @@ function App() {
         const state = pc.connectionState
         if (state === 'connected') {
           setConnectionStatus('connected')
-          setStatusMessage('已建立 P2P 连接，可以开始对局。')
+          if (autoReconnectInProgressRef.current || autoReconnectAttemptsRef.current > 0) {
+            resetAutoReconnectState()
+            setStatusMessage('连接已恢复')
+            setError(null)
+          } else {
+            setStatusMessage('已建立 P2P 连接，可以开始对局。')
+          }
         } else if (state === 'connecting') {
           setStatusMessage('正在建立连接，请稍候…')
         } else if (state === 'failed' || state === 'disconnected') {
-          setConnectionStatus('error')
-          setError('连接已中断，请尝试重新建立连接。')
+          if (connectionModeRef.current === 'offer') {
+            startAutoReconnect()
+          } else if (!autoReconnectInProgressRef.current) {
+            setConnectionStatus('error')
+            setError('连接已中断，请尝试重新建立连接。')
+          }
         }
       }
 
@@ -1111,12 +1642,14 @@ function App() {
       pcRef.current = pc
       return pc
     },
-    [resetSessionAndRolesForNewAnswerJoin, setupDataChannel],
+    [resetAutoReconnectState, resetSessionAndRolesForNewAnswerJoin, setError, setStatusMessage, setupDataChannel, startAutoReconnect],
   )
 
   const handleCreateOffer = async () => {
     try {
       setConnectionMode('offer')
+      resetAutoSignalFlags()
+      resetAutoReconnectState()
       setConnectionStatus('creating-offer')
       setStatusMessage('正在创建 Offer 并收集 ICE 候选…')
       const pc = createPeerConnection('offer')
@@ -1130,37 +1663,39 @@ function App() {
     }
   }
 
-  const handleApplyRemoteAnswer = async () => {
+  const handleApplyRemoteAnswer = async (): Promise<boolean> => {
     try {
       const pc = pcRef.current
       if (!pc) {
         setError('请先生成 Offer。')
-        return
+        return false
       }
       if (!remoteSdp.trim()) {
         setError('请先粘贴对方发送的 Answer JSON 文本。')
-        return
+        return false
       }
       const parsed = JSON.parse(remoteSdp)
       await pc.setRemoteDescription(parsed)
       setStatusMessage('已应用对方 Answer，等待连接建立…')
+      return true
     } catch (e) {
       console.error(e)
       setConnectionStatus('error')
       setError('解析或应用 Answer 失败，请确认完整复制粘贴。')
+      return false
     }
   }
 
-  const handleApplyOfferAndCreateAnswer = async () => {
+  const handleApplyOfferAndCreateAnswer = async (): Promise<boolean> => {
     try {
       setConnectionMode('answer')
       resetSessionAndRolesForNewAnswerJoin()
       setStatusMessage('正在应用对方 Offer 并创建 Answer…')
       const pc = createPeerConnection('answer')
-      if (!pc) return
+      if (!pc) return false
       if (!remoteSdp.trim()) {
         setError('请先粘贴对方发送的 Offer JSON 文本。')
-        return
+        return false
       }
       const parsed = JSON.parse(remoteSdp)
       await pc.setRemoteDescription(parsed)
@@ -1168,10 +1703,12 @@ function App() {
       await pc.setLocalDescription(answer)
       setConnectionStatus('waiting-answer')
       setStatusMessage('Answer 已生成，复制给对方后等待连接。')
+      return true
     } catch (e) {
       console.error(e)
       setConnectionStatus('error')
       setError('处理 Offer / 创建 Answer 失败，请确认 JSON 文本是否完整。')
+      return false
     }
   }
 
@@ -1183,6 +1720,17 @@ function App() {
     } catch (e) {
       console.error(e)
       setStatusMessage('复制失败，请手动全选文本后复制。')
+    }
+  }
+
+  const handleCopyShareUrl = async () => {
+    if (!shareUrl) return
+    try {
+      await navigator.clipboard.writeText(shareUrl)
+      setStatusMessage('已复制分享链接到剪贴板。')
+    } catch (e) {
+      console.error(e)
+      setStatusMessage('复制分享链接失败，请手动复制链接。')
     }
   }
 
@@ -1353,6 +1901,16 @@ function App() {
     setVoteIgnoreMessage(null)
     setIncomingEndChange(null)
     setIncomingEndNow(false)
+    setError(null)
+    setStatusMessage('')
+    setLocalSdp('')
+    setRemoteSdp('')
+    resetAutoSignalFlags()
+    resetAutoReconnectState()
+    closeBroadcastChannel()
+    if (pcRef.current) {
+      ensureSignalChannel()
+    }
   }
 
   const handleNewGameClick = () => {
@@ -1583,6 +2141,23 @@ function App() {
 
   const displayGameId = currentGameId
 
+  const shareUrl = useMemo(() => {
+    if (connectionMode !== 'offer') {
+      return ''
+    }
+    if (!localSdp) {
+      return ''
+    }
+    try {
+      const url = new URL(window.location.href)
+      url.searchParams.set('sdp', toBase64Url(localSdp))
+      return url.toString()
+    } catch (e) {
+      console.error(e)
+      return ''
+    }
+  }, [connectionMode, localSdp])
+
   const scoreDiff = scores.red - scores.blue
 
   const resultLabel = useMemo(() => {
@@ -1728,6 +2303,8 @@ function App() {
     setRemoteSdp('')
     setError(null)
     setStatusMessage('')
+    resetAutoSignalFlags()
+    resetAutoReconnectState()
   }
 
   const handleChangeHistoryTab = (value: string) => {
@@ -2178,6 +2755,36 @@ function App() {
                               </TooltipContent>
                             </Tooltip>
                           </div>
+                          <div className='flex items-center justify-between gap-2 text-[11px] text-slate-500'>
+                            <a
+                              href={shareUrl || undefined}
+                              target='_blank'
+                              rel='noreferrer'
+                              className={
+                                shareUrl
+                                  ? 'text-sky-600 hover:text-sky-700 hover:underline'
+                                  : 'cursor-not-allowed text-slate-400'
+                              }
+                              onClick={(event) => {
+                                if (!shareUrl) {
+                                  event.preventDefault()
+                                }
+                              }}
+                            >
+                              分享链接（自动解析）
+                            </a>
+                            <Button
+                              type='button'
+                              variant='outline'
+                              size='sm'
+                              className='inline-flex h-7 items-center gap-1 rounded-full border-slate-200 px-2 text-[11px]'
+                              onClick={handleCopyShareUrl}
+                              disabled={!shareUrl}
+                            >
+                              <Copy className='h-3 w-3' />
+                              复制分享链接
+                            </Button>
+                          </div>
                         </div>
                         <div className='space-y-1.5'>
                           <Label className='text-[11px] text-slate-700'>
@@ -2280,6 +2887,70 @@ function App() {
                 <CardHeader className='pb-3'>
                   <CardTitle className='flex items-center gap-2 text-base'>
                     <Timer className='h-4 w-4 text-slate-500' />
+                    <span>协商修改结束时间 / 立即结束</span>
+                  </CardTitle>
+                  <CardDescription className='text-xs text-slate-600'>
+                    在本局进行中，可向对方提议调整结束时间或立即结束，只有对方同意后才会真正生效。
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className='space-y-3'>
+                  <div className='space-y-2'>
+                    <Label className='text-[11px] text-slate-700'>
+                      提议的新结束时间
+                    </Label>
+                    <div className='flex items-center gap-2'>
+                      <Input
+                        type='datetime-local'
+                        className='h-8 rounded-full border-slate-200 bg-white px-3 text-[11px]'
+                        value={proposedEndTimeInput || initialEndTimeInput}
+                        onChange={(e) => setProposedEndTimeInput(e.target.value)}
+                      />
+                      <span className='text-[11px] text-slate-500'>
+                        仅在本局进行中有效，建议基于当前结束时间适度延后或提前。
+                      </span>
+                    </div>
+                  </div>
+                  <div className='flex flex-wrap items-center gap-2'>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='outline'
+                      className='h-8 rounded-full border-slate-200 px-3 text-[11px] text-slate-700 disabled:cursor-not-allowed disabled:opacity-60'
+                      onClick={handleProposeEndChange}
+                      disabled={!isConnected || gameState !== 'running' || !currentRoundId}
+                    >
+                      提议延后/提前结束时间
+                    </Button>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='outline'
+                      className='h-8 rounded-full border-red-200 bg-red-50 px-3 text-[11px] text-red-700 disabled:cursor-not-allowed disabled:opacity-60'
+                      onClick={handleProposeEndNow}
+                      disabled={!isConnected || gameState !== 'running' || !currentRoundId}
+                    >
+                      提议立即结束本局
+                    </Button>
+                  </div>
+                  {infoMessage && (
+                    <div className='rounded-lg bg-slate-50 px-3 py-2 text-[11px] text-slate-600'>
+                      {infoMessage}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+
+            <div className='flex flex-col gap-4 md:gap-5'>
+              <Card
+                ref={step3Ref}
+                className={`border-slate-200/80 shadow-sm ${
+                  highlightStep3 ? 'animate-pulse ring-2 ring-emerald-300' : ''
+                }`}
+              >
+                <CardHeader className='pb-3'>
+                  <CardTitle className='flex items-center gap-2 text-base'>
+                    <Timer className='h-4 w-4 text-slate-500' />
                     <span>步骤 3 · 设置结束时间点并开始本局</span>
                   </CardTitle>
                   <CardDescription className='text-xs text-slate-600'>
@@ -2345,81 +3016,17 @@ function App() {
                         <Gamepad2 className='h-3.5 w-3.5' />
                         开始本局
                       </Button>
-                      <Button
-                        type='button'
-                        size='sm'
-                        variant='outline'
-                        className='inline-flex items-center gap-1.5 rounded-full border-slate-200 px-3 text-[11px] text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60'
-                        onClick={handleNewGameClick}
-                        disabled={false}
-                      >
-                        新开一局
-                      </Button>
                     </div>
                   </div>
                 </CardContent>
               </Card>
 
-              <Card className='border-slate-200/80 shadow-sm'>
-                <CardHeader className='pb-3'>
-                  <CardTitle className='flex items-center gap-2 text-base'>
-                    <Timer className='h-4 w-4 text-slate-500' />
-                    <span>协商修改结束时间 / 立即结束</span>
-                  </CardTitle>
-                  <CardDescription className='text-xs text-slate-600'>
-                    在本局进行中，可向对方提议调整结束时间或立即结束，只有对方同意后才会真正生效。
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className='space-y-3'>
-                  <div className='space-y-2'>
-                    <Label className='text-[11px] text-slate-700'>
-                      提议的新结束时间
-                    </Label>
-                    <div className='flex items-center gap-2'>
-                      <Input
-                        type='datetime-local'
-                        className='h-8 rounded-full border-slate-200 bg-white px-3 text-[11px]'
-                        value={proposedEndTimeInput || initialEndTimeInput}
-                        onChange={(e) => setProposedEndTimeInput(e.target.value)}
-                      />
-                      <span className='text-[11px] text-slate-500'>
-                        仅在本局进行中有效，建议基于当前结束时间适度延后或提前。
-                      </span>
-                    </div>
-                  </div>
-                  <div className='flex flex-wrap items-center gap-2'>
-                    <Button
-                      type='button'
-                      size='sm'
-                      variant='outline'
-                      className='h-8 rounded-full border-slate-200 px-3 text-[11px] text-slate-700 disabled:cursor-not-allowed disabled:opacity-60'
-                      onClick={handleProposeEndChange}
-                      disabled={!isConnected || gameState !== 'running' || !currentRoundId}
-                    >
-                      提议延后/提前结束时间
-                    </Button>
-                    <Button
-                      type='button'
-                      size='sm'
-                      variant='outline'
-                      className='h-8 rounded-full border-red-200 bg-red-50 px-3 text-[11px] text-red-700 disabled:cursor-not-allowed disabled:opacity-60'
-                      onClick={handleProposeEndNow}
-                      disabled={!isConnected || gameState !== 'running' || !currentRoundId}
-                    >
-                      提议立即结束本局
-                    </Button>
-                  </div>
-                  {infoMessage && (
-                    <div className='rounded-lg bg-slate-50 px-3 py-2 text-[11px] text-slate-600'>
-                      {infoMessage}
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            </div>
-
-            <div className='flex flex-col gap-4 md:gap-5'>
-              <Card className='border-slate-200/80 shadow-sm'>
+              <Card
+                ref={step4Ref}
+                className={`border-slate-200/80 shadow-sm ${
+                  highlightStep4 ? 'animate-pulse ring-2 ring-sky-300' : ''
+                }`}
+              >
                 <CardHeader className='pb-3'>
                   <CardTitle className='flex items-center justify-between text-base'>
                     <span className='flex items-center gap-2'>
