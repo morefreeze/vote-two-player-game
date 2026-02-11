@@ -180,6 +180,7 @@ function App() {
 
   const [localSdp, setLocalSdp] = useState('')
   const [remoteSdp, setRemoteSdp] = useState('')
+  const [remoteAnswerCipher, setRemoteAnswerCipher] = useState('')
 
   const [gameState, setGameState] = useState<GameState>('idle')
   const [currentRoundId, setCurrentRoundId] = useState<string | null>(null)
@@ -244,6 +245,8 @@ function App() {
   const autoReconnectInProgressRef = useRef(false)
   const autoReconnectAttemptsRef = useRef(0)
   const autoReconnectTimerRef = useRef<number | null>(null)
+  const hasRemoteAnswerAppliedRef = useRef(false)
+  const hasEverConnectedRef = useRef(false)
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null)
   const signalMessageHandlerRef = useRef<(data: any) => void>(() => {})
   const connectionStatusRef = useRef<ConnectionStatus>('idle')
@@ -579,6 +582,11 @@ function App() {
       return
     }
 
+    if (!hasRemoteAnswerAppliedRef.current && !hasEverConnectedRef.current) {
+      resetAutoReconnectState()
+      return
+    }
+
     const maxAttempts = 3
     const attemptIndex = autoReconnectAttemptsRef.current
     if (attemptIndex >= maxAttempts) {
@@ -641,6 +649,9 @@ function App() {
       return
     }
     if (connectionModeRef.current !== 'offer') {
+      return
+    }
+    if (!hasRemoteAnswerAppliedRef.current && !hasEverConnectedRef.current) {
       return
     }
     const pc = pcRef.current
@@ -1045,6 +1056,8 @@ function App() {
     resetAutoSignalFlags()
     resetAutoReconnectState()
     closeBroadcastChannel()
+    hasRemoteAnswerAppliedRef.current = false
+    hasEverConnectedRef.current = false
   }, [clearAssignRolesRetryTimer, closeBroadcastChannel, resetAutoReconnectState, resetGameState, resetAutoSignalFlags])
 
   useEffect(() => {
@@ -1173,6 +1186,9 @@ function App() {
         return
       }
       if (!pcRef.current) {
+        return
+      }
+      if (!hasRemoteAnswerAppliedRef.current && !hasEverConnectedRef.current) {
         return
       }
       autoReconnectInProgressRef.current = true
@@ -1586,6 +1602,10 @@ function App() {
       setError(null)
       setLocalSdp('')
       setRemoteSdp('')
+      setRemoteAnswerCipher('')
+
+      hasRemoteAnswerAppliedRef.current = false
+      hasEverConnectedRef.current = false
 
       const pc = new RTCPeerConnection({ iceServers })
 
@@ -1602,6 +1622,7 @@ function App() {
         const state = pc.connectionState
         if (state === 'connected') {
           setConnectionStatus('connected')
+          hasEverConnectedRef.current = true
           if (autoReconnectInProgressRef.current || autoReconnectAttemptsRef.current > 0) {
             resetAutoReconnectState()
             setStatusMessage('连接已恢复')
@@ -1615,8 +1636,14 @@ function App() {
           if (connectionModeRef.current === 'offer') {
             startAutoReconnect()
           } else if (!autoReconnectInProgressRef.current) {
-            setConnectionStatus('error')
-            setError('连接已中断，请尝试重新建立连接。')
+            if (!hasEverConnectedRef.current) {
+              setConnectionStatus('waiting-answer')
+              setStatusMessage('Answer 已生成，等待发起方应用后建立连接。')
+              setError(null)
+            } else {
+              setConnectionStatus('error')
+              setError('连接已中断，请尝试重新建立连接。')
+            }
           }
         }
       }
@@ -1667,27 +1694,51 @@ function App() {
     }
   }
 
-  const handleApplyRemoteAnswer = async (): Promise<boolean> => {
+  const handleApplyRemoteAnswer = async (raw?: string): Promise<boolean> => {
+    const pc = pcRef.current
+    if (!pc) {
+      setError('请先生成 Offer。')
+      return false
+    }
+
+    const sourceText = (typeof raw === 'string' ? raw : remoteSdp).trim()
+    if (!sourceText) {
+      setError('请先粘贴对方发送的 Answer 文本。')
+      return false
+    }
+
+    let parsed: any
     try {
-      const pc = pcRef.current
-      if (!pc) {
-        setError('请先生成 Offer。')
+      parsed = JSON.parse(sourceText)
+    } catch (jsonErr) {
+      try {
+        const decoded = fromBase64Url(sourceText)
+        parsed = JSON.parse(decoded)
+      } catch (decodeErr) {
+        console.error('解析 Answer 文本失败', jsonErr, decodeErr)
+        setConnectionStatus('error')
+        setError('解析或应用 Answer 失败，请确认完整复制粘贴。')
         return false
       }
-      if (!remoteSdp.trim()) {
-        setError('请先粘贴对方发送的 Answer JSON 文本。')
-        return false
-      }
-      const parsed = JSON.parse(remoteSdp)
+    }
+
+    try {
       await pc.setRemoteDescription(parsed)
-      setStatusMessage('已应用对方 Answer，等待连接建立…')
-      return true
-    } catch (e) {
-      console.error(e)
+    } catch (setErr) {
+      console.error(setErr)
       setConnectionStatus('error')
       setError('解析或应用 Answer 失败，请确认完整复制粘贴。')
       return false
     }
+
+    hasRemoteAnswerAppliedRef.current = true
+    setStatusMessage('已应用对方 Answer，等待连接建立…')
+    setError(null)
+    return true
+  }
+
+  const handleApplyRemoteAnswerCipher = async (): Promise<boolean> => {
+    return handleApplyRemoteAnswer(remoteAnswerCipher)
   }
 
   const handleApplyOfferAndCreateAnswer = async (): Promise<boolean> => {
@@ -1724,6 +1775,18 @@ function App() {
     } catch (e) {
       console.error(e)
       setStatusMessage('复制失败，请手动全选文本后复制。')
+    }
+  }
+
+  const handleCopyAnswerCipher = async () => {
+    if (!localSdp) return
+    try {
+      const cipher = toBase64Url(localSdp)
+      await navigator.clipboard.writeText(cipher)
+      setStatusMessage('已复制 Answer 密文到剪贴板。')
+    } catch (e) {
+      console.error(e)
+      setStatusMessage('复制 Answer 密文失败，请手动全选文本后复制。')
     }
   }
 
@@ -1909,6 +1972,7 @@ function App() {
     setStatusMessage('')
     setLocalSdp('')
     setRemoteSdp('')
+    setRemoteAnswerCipher('')
     resetAutoSignalFlags()
     resetAutoReconnectState()
     closeBroadcastChannel()
@@ -2305,6 +2369,7 @@ function App() {
     setConnectionMode(mode)
     setLocalSdp('')
     setRemoteSdp('')
+    setRemoteAnswerCipher('')
     setError(null)
     setStatusMessage('')
     resetAutoSignalFlags()
@@ -2790,25 +2855,52 @@ function App() {
                             </Button>
                           </div>
                         </div>
-                        <div className='space-y-1.5'>
-                          <Label className='text-[11px] text-slate-700'>
-                            对方 Answer JSON（粘贴后点击应用）
-                          </Label>
-                          <Textarea
-                            className='h-24 resize-none rounded-xl border-slate-200 bg-white text-[11px]'
-                            value={remoteSdp}
-                            onChange={(e) => setRemoteSdp(e.target.value)}
-                            placeholder='请让对方将 Answer JSON 文本发给你，完整粘贴在此处。'
-                          />
-                          <div className='flex justify-end'>
-                            <Button
-                              type='button'
-                              size='sm'
-                              className='h-8 rounded-full bg-slate-900 px-3 text-[11px] font-medium text-slate-50 hover:bg-slate-800'
-                              onClick={handleApplyRemoteAnswer}
-                            >
-                              应用 Answer 并连接
-                            </Button>
+                        <div className='space-y-3'>
+                          <div className='space-y-1.5'>
+                            <Label className='text-[11px] text-slate-700'>
+                              对方 Answer JSON（粘贴后点击应用）
+                            </Label>
+                            <Textarea
+                              className='h-24 resize-none rounded-xl border-slate-200 bg-white text-[11px]'
+                              value={remoteSdp}
+                              onChange={(e) => setRemoteSdp(e.target.value)}
+                              placeholder='请让对方将 Answer JSON 文本发给你，完整粘贴在此处。'
+                            />
+                            <div className='flex justify-end'>
+                              <Button
+                                type='button'
+                                size='sm'
+                                className='h-8 rounded-full bg-slate-900 px-3 text-[11px] font-medium text-slate-50 hover:bg-slate-800'
+                                onClick={() => {
+                                  void handleApplyRemoteAnswer()
+                                }}
+                              >
+                                应用 Answer 并连接
+                              </Button>
+                            </div>
+                          </div>
+                          <div className='space-y-1.5'>
+                            <Label className='text-[11px] text-slate-700'>
+                              对方 Answer 密文（Base64URL）
+                            </Label>
+                            <Textarea
+                              className='h-20 resize-none rounded-xl border-slate-200 bg-white text-[11px]'
+                              value={remoteAnswerCipher}
+                              onChange={(e) => setRemoteAnswerCipher(e.target.value)}
+                              placeholder='对方若发送的是 Answer 密文（短字符串），请完整粘贴在此处。'
+                            />
+                            <div className='flex justify-end'>
+                              <Button
+                                type='button'
+                                size='sm'
+                                className='h-8 rounded-full bg-slate-900 px-3 text-[11px] font-medium text-slate-50 hover:bg-slate-800'
+                                onClick={() => {
+                                  void handleApplyRemoteAnswerCipher()
+                                }}
+                              >
+                                应用密文并连接
+                              </Button>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -2862,18 +2954,30 @@ function App() {
                             readOnly
                             placeholder='点击上方按钮后，这里会生成 Answer JSON 文本，请完整复制发给发起方。'
                           />
-                          <div className='flex items-center justify-between gap-2 text-[11px] text-slate-500'>
+                          <div className='flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500'>
                             <span>只有当此处出现完整 JSON 文本时，才说明 ICE 收集完成。</span>
-                            <Button
-                              type='button'
-                              variant='outline'
-                              size='sm'
-                              className='h-7 rounded-full border-slate-200 px-2 text-[11px]'
-                              onClick={handleCopyLocalSdp}
-                              disabled={!localSdp}
-                            >
-                              复制 Answer
-                            </Button>
+                            <div className='flex flex-wrap items-center gap-2'>
+                              <Button
+                                type='button'
+                                variant='outline'
+                                size='sm'
+                                className='h-7 rounded-full border-slate-200 px-2 text-[11px]'
+                                onClick={handleCopyLocalSdp}
+                                disabled={!localSdp}
+                              >
+                                复制 Answer JSON
+                              </Button>
+                              <Button
+                                type='button'
+                                variant='outline'
+                                size='sm'
+                                className='h-7 rounded-full border-slate-200 px-2 text-[11px]'
+                                onClick={handleCopyAnswerCipher}
+                                disabled={!localSdp}
+                              >
+                                复制 Answer 密文
+                              </Button>
+                            </div>
                           </div>
                         </div>
                       </div>
