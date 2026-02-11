@@ -854,18 +854,22 @@ function App() {
         case 'vote': {
           if (!currentRoundIdRef.current || msg.roundId !== currentRoundIdRef.current) return
           const localLockedRole = lockedRoleRef.current
+          // 若尚未锁定角色，则根据收到的投票目标进行自动锁定并应用
           if (!localLockedRole) {
-            return
+            setRoleLocked(true)
+            setLockedRole(msg.target)
+            setRoleSyncMessage(`角色已锁定：${formatRoleLabel(msg.target)}（根据对局数据自动锁定）`)
+            applyVote(msg.target, msg.at)
+            break
           }
+          // 若已锁定但不一致，则校正为对局数据中的目标再应用
           if (msg.target !== localLockedRole) {
-            console.warn('投票被忽略：目标阵营不匹配', {
-              expected: localLockedRole,
-              received: msg.target,
-            })
-            setVoteIgnoreMessage('角色未正确分配，已自动校正，请重试。')
-            ensureRoleFromSessionRoles('vote-mismatch')
-            return
+            setRoleSyncMessage('角色未正确分配，已按对局数据校正。')
+            setLockedRole(msg.target)
+            applyVote(msg.target, msg.at)
+            break
           }
+          // 一致则正常应用
           applyVote(msg.target, msg.at)
           break
         }
